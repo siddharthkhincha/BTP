@@ -8,7 +8,8 @@ import os
 from sentence_transformers import SentenceTransformer
 import re
 from sklearn.metrics.pairwise import cosine_similarity
-
+import argparse
+from transformers import pipeline
 
 def extract_negated_claims(output):
     # Split the output by newline
@@ -83,41 +84,81 @@ def get_evidence(claim_encoding,evidence_encodings,top_n,evidences):
     return " ".join(top_evidences)
 
 def get_dataset():
-    for fileno in tqdm(list(pos_claims.keys())[:]):
-        js_file = json.loads(open("Parsed_pds/%s.json"%fileno,"r").read())
-        body_text = js_file['pdf_parse']['body_text']
-        text = [x['text'] for x in body_text if not isConclusion(x['section'])]
-        if len(js_file['pdf_parse']['abstract'])>0:
-            text.insert(0,js_file['pdf_parse']['abstract'][0]['text'])
-        text = " ".join(text)
-        doc = nlp(text)
-        sentences = [str(x) for x in doc.sents if len(x)>5]
-        
-        enc = get_encodings(fileno,sentences)
-        claim_enc = encoder.encode(pos_claims[fileno])
+	dataset = []
+	for fileno in tqdm(list(pos_claims.keys())[:10]):
+		js_file = json.loads(open("Parsed_pds/%s.json"%fileno,"r").read())
+		body_text = js_file['pdf_parse']['body_text']
+		text = [x['text'] for x in body_text if not isConclusion(x['section'])]
+		if len(js_file['pdf_parse']['abstract'])>0:
+			text.insert(0,js_file['pdf_parse']['abstract'][0]['text'])
+		text = " ".join(text)
+		doc = nlp(text)
+		sentences = [str(x) for x in doc.sents if len(x)>5]
+		
+		enc = get_encodings(fileno,sentences)
+		claim_enc = encoder.encode(pos_claims[fileno])
 
-        for idx,claim in enumerate(pos_claims[fileno]):
-            ev = get_evidence(claim_enc[idx],enc,10,sentences)
-            dataset.append([fileno,"positive",claim,ev])
+		for idx,claim in enumerate(pos_claims[fileno]):
+			ev = get_evidence(claim_enc[idx],enc,10,sentences)
+			dataset.append([fileno,"positive",claim,ev])
         
-        for idx,claim in enumerate(pos_claims[fileno]):
-            ev = get_evidence(claim_enc[idx],enc,10,sentences)
-            dataset.append([fileno,"positive",claim,ev])
-        for positive_claim in neg_claims[fileno]:
-            for x in extract_negated_claims(neg_claims[fileno][positive_claim][0]):
-                ev = get_evidence(encoder.encode(x),enc,10,sentences)
-                dataset.append([fileno,"negative",x,ev])
-        
+		for idx,claim in enumerate(pos_claims[fileno]):
+			ev = get_evidence(claim_enc[idx],enc,10,sentences)
+			dataset.append([fileno,"positive",claim,ev])
+		for positive_claim in neg_claims[fileno]:
+			for x in extract_negated_claims(neg_claims[fileno][positive_claim][0]):
+				ev = get_evidence(encoder.encode(x),enc,10,sentences)
+				dataset.append([fileno,"negative",x,ev])
+		#print(dataset)
+	dataset = pd.DataFrame(dataset,columns=["FileNo","Type","Claim","Evidence"])
+	return dataset
 
+def T5_eval():
+    pipe = pipeline('text2text-generation', model='google-t5/t5-base')
+    prompt = '''verify claim: %s <sep> evidence: %s <sep>'''
+    outputs = []
+    
+    for row in tqdm(list(dataset.itertuples())):
+        claim = row[3]
+        evidence = row[4]
+        response = pipe(prompt%(claim,evidence),max_length=64,num_return_sequences=1)
+        output = response[0]['generated_text']
+
+        outputs.append(output)
+    dataset["Output"] = outputs
+    
+    dataset.to_csv(output_file,index=False)
+def llama_eval():
+	pass
 
 if __name__ == "__main__":
-    os.environ["HF_HOME"] = "/data/btp_data/Siddharth/huggingface_cache/"
+    #os.environ["HF_HOME"] = "/data/btp_data/Siddharth/huggingface_cache/"
     encoder = SentenceTransformer('all-mpnet-base-v2')
     nlp = spacy.load("en_core_web_sm")
 
     pos_claims = json.loads(open("positive_claims_extracted.json","r").read())
-    neg_claims = json.loads(open('negative_claims_generated.json',"r").read())
-    with open("pdf_encoded.pickle","rb") as f:
-        encodings_dict = pickle.load(f)
+    neg_claims = json.loads(open('negative_claims_generated.json',"r").read())    
+    
+    try:
+        dataset = pd.read_csv("Final_dataset.csv")
+    except:
+        
+        dataset = get_dataset()
+        dataset.to_csv("Final_dataset.csv",index=False)
 
-    dataset = get_dataset()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-m', dest='model', type=str, required=True)
+    parser.add_argument('-o', dest='output', type=str, required=True)
+    parser.add_argument('-n', dest='num_examples', type=int, required=False)
+    args = parser.parse_args()
+    model = args.model
+    output_file = args.output
+    num_examples = len(dataset)
+    if args.num_examples is not None:
+        num_examples = args.num_examples
+    dataset = dataset.iloc[:num_examples]
+    model_to_func_mapping = {
+    'T5':T5_eval,
+    'llama':llama_eval
+    }
+    model_to_func_mapping[model]()
